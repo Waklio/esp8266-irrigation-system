@@ -1,0 +1,10 @@
+# PlatformIO
+.pio/
+
+# VS Code
+.vscode/
+
+# Binários e builds
+*.bin
+*.elf
+*.map
