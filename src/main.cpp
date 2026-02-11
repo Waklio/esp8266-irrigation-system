@@ -1,18 +1,23 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <time.h>
 #include "config.h"
 
 ESP8266WebServer server(80);
 
 // ===== ESTADOS =====
 bool valvulaAberta = false;
-bool modoAutomatico = false;
-unsigned long ultimoTempoLeitura = 0;
+bool modoAutomatico = true;
+bool jaRegouHoje = false;
+bool irrigandoAgora = false;
+
+unsigned long inicioRega = 0;
+
 int ultimaUmidade = 0;
 String statusSolo = "Sem leitura";
 
-// ===== FUNÇÕES HARDWARE =====
+// ===== CONTROLE DA VALVULA (RELÉ ATIVO EM LOW) =====
 
 void abrirValvula() {
   digitalWrite(PINO_VALVULA, LOW);
@@ -26,15 +31,13 @@ void fecharValvula() {
   Serial.println("Valvula FECHADA");
 }
 
+// ===== LEITURA DO SENSOR =====
+
 int lerUmidade() {
-  digitalWrite(PINO_SENSOR_VCC, HIGH);
-  delay(300);
-  int leitura = analogRead(PINO_SENSOR);
-  digitalWrite(PINO_SENSOR_VCC, LOW);
-  return leitura;
+  return analogRead(PINO_SENSOR);
 }
 
-// ===== API STATUS (AJAX) =====
+// ===== API STATUS =====
 
 void enviarStatus() {
   String json = "{";
@@ -47,7 +50,7 @@ void enviarStatus() {
   server.send(200, "application/json", json);
 }
 
-// ===== PÁGINA WEB =====
+// ===== PAGINA WEB =====
 
 void paginaPrincipal() {
   String html = "<html><head>";
@@ -61,8 +64,8 @@ void paginaPrincipal() {
 
   html += "<p>Modo: <b id='modo'>---</b></p>";
   html += "<p>Valvula: <b id='valvula'>---</b></p>";
-  html += "<p>Umidade (A0): <b id='umidade'>---</b></p>";
-  html += "<p>Status do Solo: <b id='statusSolo'>---</b></p>";
+  html += "<p>Umidade: <b id='umidade'>---</b></p>";
+  html += "<p>Status Solo: <b id='statusSolo'>---</b></p>";
 
   html += "<a href='/manual'><button>Modo Manual</button></a><br>";
   html += "<a href='/auto'><button>Modo Automatico</button></a><br><br>";
@@ -85,6 +88,7 @@ void paginaPrincipal() {
   html += "</script>";
 
   html += "</body></html>";
+
   server.send(200, "text/html", html);
 }
 
@@ -95,12 +99,9 @@ void setup() {
   delay(1000);
 
   pinMode(PINO_VALVULA, OUTPUT);
-  pinMode(PINO_SENSOR_VCC, OUTPUT);
-
   fecharValvula();
-  digitalWrite(PINO_SENSOR_VCC, LOW);
 
-  Serial.println("Conectando ao Wi-Fi...");
+  Serial.println("Conectando WiFi...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -108,22 +109,17 @@ void setup() {
     Serial.print(".");
   }
 
-  Serial.println();
-  Serial.print("Wi-Fi conectado. IP: ");
+  Serial.println("\nWiFi conectado");
   Serial.println(WiFi.localIP());
 
+  // NTP Brasil GMT-3
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("Sincronizando hora...");
+  delay(3000);
+
+  // ROTAS
   server.on("/", paginaPrincipal);
   server.on("/status", enviarStatus);
-
-  server.on("/abrir", []() {
-    if (!modoAutomatico) abrirValvula();
-    paginaPrincipal();
-  });
-
-  server.on("/fechar", []() {
-    if (!modoAutomatico) fecharValvula();
-    paginaPrincipal();
-  });
 
   server.on("/manual", []() {
     modoAutomatico = false;
@@ -137,6 +133,16 @@ void setup() {
     paginaPrincipal();
   });
 
+  server.on("/abrir", []() {
+    if (!modoAutomatico && !irrigandoAgora) abrirValvula();
+    paginaPrincipal();
+  });
+
+  server.on("/fechar", []() {
+    if (!modoAutomatico) fecharValvula();
+    paginaPrincipal();
+  });
+
   server.begin();
   Serial.println("Servidor HTTP iniciado");
 }
@@ -146,30 +152,47 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  if (modoAutomatico) {
-    unsigned long agora = millis();
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
 
-    if (agora - ultimoTempoLeitura >= INTERVALO_LEITURA) {
-      ultimoTempoLeitura = agora;
+  int horaAtual = timeinfo->tm_hour;
+  int minutoAtual = timeinfo->tm_min;
 
-      ultimaUmidade = lerUmidade();
+  // Reset diário à meia-noite
+  if (horaAtual == 0 && minutoAtual == 0) {
+    jaRegouHoje = false;
+  }
 
-      Serial.print("Umidade: ");
-      Serial.println(ultimaUmidade);
+  // ===== DISPARO EXATO ÀS 16:00 =====
+  if (modoAutomatico &&
+      horaAtual == HORA_REGA &&
+      minutoAtual == 0 &&
+      !jaRegouHoje &&
+      !irrigandoAgora) {
 
-      if (ultimaUmidade > SOLO_SECO) {
-        statusSolo = "Solo SECO, irrigando";
-        Serial.println(statusSolo);
+    ultimaUmidade = lerUmidade();
 
-        abrirValvula();
-        delay(TEMPO_REGA);
-        fecharValvula();
-      } else {
-        statusSolo = "Solo OK, sem irrigacao";
-        Serial.println(statusSolo);
-      }
+    Serial.print("Umidade: ");
+    Serial.println(ultimaUmidade);
 
-      Serial.println("----------------------------");
+    if (ultimaUmidade > SOLO_SECO) {
+      statusSolo = "Solo seco - irrigando";
+      abrirValvula();
+      inicioRega = millis();
+      irrigandoAgora = true;
+    } else {
+      statusSolo = "Solo umido - sem irrigacao";
+      jaRegouHoje = true;
+    }
+  }
+
+  // ===== CONTROLE SEM DELAY =====
+  if (irrigandoAgora) {
+    if (millis() - inicioRega >= TEMPO_REGA) {
+      fecharValvula();
+      irrigandoAgora = false;
+      jaRegouHoje = true;
+      Serial.println("Rega finalizada automaticamente");
     }
   }
 }
